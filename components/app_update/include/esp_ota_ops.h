@@ -33,6 +33,10 @@ extern "C"
 #define ESP_ERR_OTA_SELECT_INFO_INVALID          (ESP_ERR_OTA_BASE + 0x02)  /*!< Error if OTA data partition contains invalid content */
 #define ESP_ERR_OTA_VALIDATE_FAILED              (ESP_ERR_OTA_BASE + 0x03)  /*!< Error if OTA app image is invalid */
 
+
+#define   IS_SPIFFS_PARTITION                     2
+#define   IS_OTA_PARTITION                        1
+#define   INVALID_PARTITION                       0
 /**
  * @brief Opaque handle for an application OTA update
  *
