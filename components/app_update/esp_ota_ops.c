@@ -65,13 +65,17 @@ static LIST_HEAD(ota_ops_entries_head, ota_ops_entry_) s_ota_ops_entries_head =
 static uint32_t s_ota_ops_last_handle = 0;
 static ota_select s_ota_select[2];
 
+static bool is_spiffs_update = false;
+
 const static char *TAG = "esp_ota_ops";
 
 /* Return true if this is an OTA app partition */
 static uint8_t is_ota_partition(const esp_partition_t *p)
 {
+    is_spiffs_update = false;
     if (p->type == ESP_PARTITION_TYPE_DATA && p->subtype == ESP_PARTITION_SUBTYPE_DATA_SPIFFS)
     {
+        is_spiffs_update = true;
         return IS_SPIFFS_PARTITION;
     }
     else
@@ -158,10 +162,13 @@ esp_err_t esp_ota_write(esp_ota_handle_t handle, const void *data, size_t size)
             // must erase the partition before writing to it
             assert(it->erased_size > 0 && "must erase the partition before writing to it");
 
-            // if(it->wrote_size == 0 && size > 0 && data_bytes[0] != 0xE9) {
-            //     ESP_LOGE(TAG, "OTA image has invalid magic byte (expected 0xE9, saw 0x%02x", data_bytes[0]);
-            //     return ESP_ERR_OTA_VALIDATE_FAILED;
-            // }
+            if(!is_spiffs_update)
+            {
+                if(it->wrote_size == 0 && size > 0 && data_bytes[0] != 0xE9) {
+                    ESP_LOGE(TAG, "OTA image has invalid magic byte (expected 0xE9, saw 0x%02x", data_bytes[0]);
+                    return ESP_ERR_OTA_VALIDATE_FAILED;
+                }
+            }
 
             if (esp_flash_encryption_enabled()) {
                 /* Can only write 16 byte blocks to flash, so need to cache anything else */
