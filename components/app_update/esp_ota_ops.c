@@ -68,12 +68,25 @@ static ota_select s_ota_select[2];
 const static char *TAG = "esp_ota_ops";
 
 /* Return true if this is an OTA app partition */
-static bool is_ota_partition(const esp_partition_t *p)
+static uint8_t is_ota_partition(const esp_partition_t *p)
 {
-    return (p != NULL
-            && p->type == ESP_PARTITION_TYPE_APP
-            && p->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_0
-            && p->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MAX);
+    if (p->type == ESP_PARTITION_TYPE_DATA && p->subtype == ESP_PARTITION_SUBTYPE_DATA_SPIFFS)
+    {
+        return IS_SPIFFS_PARTITION;
+    }
+    else
+    {
+        if (p != NULL && p->type == ESP_PARTITION_TYPE_APP && p->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_0
+                                                           && p->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MAX)
+        {
+            return IS_OTA_PARTITION;
+        }
+        else
+        {
+            return INVALID_PARTITION;
+        }
+    }
+    
 }
 
 esp_err_t esp_ota_begin(const esp_partition_t *partition, size_t image_size, esp_ota_handle_t *out_handle)
@@ -90,7 +103,7 @@ esp_err_t esp_ota_begin(const esp_partition_t *partition, size_t image_size, esp
         return ESP_ERR_NOT_FOUND;
     }
 
-    if (!is_ota_partition(partition)) {
+    if (is_ota_partition(partition) == INVALID_PARTITION) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -145,10 +158,10 @@ esp_err_t esp_ota_write(esp_ota_handle_t handle, const void *data, size_t size)
             // must erase the partition before writing to it
             assert(it->erased_size > 0 && "must erase the partition before writing to it");
 
-            if(it->wrote_size == 0 && size > 0 && data_bytes[0] != 0xE9) {
-                ESP_LOGE(TAG, "OTA image has invalid magic byte (expected 0xE9, saw 0x%02x", data_bytes[0]);
-                return ESP_ERR_OTA_VALIDATE_FAILED;
-            }
+            // if(it->wrote_size == 0 && size > 0 && data_bytes[0] != 0xE9) {
+            //     ESP_LOGE(TAG, "OTA image has invalid magic byte (expected 0xE9, saw 0x%02x", data_bytes[0]);
+            //     return ESP_ERR_OTA_VALIDATE_FAILED;
+            // }
 
             if (esp_flash_encryption_enabled()) {
                 /* Can only write 16 byte blocks to flash, so need to cache anything else */
