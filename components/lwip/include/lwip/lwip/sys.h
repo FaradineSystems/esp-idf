@@ -148,6 +148,10 @@ err_t sys_sem_new(sys_sem_t *sem, u8_t count);
 /** Signals a semaphore
  * @param sem the semaphore to signal */
 void sys_sem_signal(sys_sem_t *sem);
+/** Signals a semaphore (ISR version)
+ * @param sem the semaphore to signal
+ * @return non-zero if a higher priority task has been woken  */
+int sys_sem_signal_isr(sys_sem_t *sem);
 /** Wait for a semaphore for the specified timeout
  * @param sem the semaphore to wait for
  * @param timeout timeout in milliseconds to wait (0 = wait forever)
@@ -205,6 +209,17 @@ err_t sys_mbox_trypost(sys_mbox_t *mbox, void *msg);
            or SYS_ARCH_TIMEOUT on timeout
  *         The returned time has to be accurate to prevent timer jitter! */
 u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout);
+
+#if ESP_THREAD_SAFE
+/**
+ * @ingroup sys_mbox
+ * Set the owner of the mbox
+ * @param mbox mbox to set the owner
+ * @param owner the owner of the mbox, it's a pointer to struct netconn
+ */
+void sys_mbox_set_owner(sys_mbox_t *mbox, void *owner);
+#endif
+
 /* Allow port to override with a macro, e.g. special timeout for sys_arch_mbox_fetch() */
 #ifndef sys_arch_mbox_tryfetch
 /** Wait for a new message to arrive in the mbox

@@ -27,14 +27,14 @@
 #include <stdarg.h>
 #include <string.h>
 
-#include "bt_types.h"
-#include "controller.h"
-#include "hcimsgs.h"
-#include "btu.h"
+#include "stack/bt_types.h"
+#include "device/controller.h"
+#include "stack/hcimsgs.h"
+#include "stack/btu.h"
 #include "btm_int.h"
 #include "l2c_int.h"
-#include "fixed_queue.h"
-#include "alarm.h"
+#include "osi/fixed_queue.h"
+#include "osi/alarm.h"
 
 #if (BT_USE_TRACES == TRUE && BT_TRACE_VERBOSE == FALSE)
 /* needed for sprintf() */
@@ -90,7 +90,7 @@ static tBTM_STATUS btm_sec_send_hci_disconnect (tBTM_SEC_DEV_REC *p_dev_rec, UIN
 UINT8           btm_sec_start_role_switch (tBTM_SEC_DEV_REC *p_dev_rec);
 tBTM_SEC_DEV_REC *btm_sec_find_dev_by_sec_state (UINT8 state);
 
-static BOOLEAN  btm_sec_set_security_level ( CONNECTION_TYPE conn_type, char *p_name, UINT8 service_id,
+static BOOLEAN  btm_sec_set_security_level ( CONNECTION_TYPE conn_type, const char *p_name, UINT8 service_id,
         UINT16 sec_level, UINT16 psm, UINT32 mx_proto_id,
         UINT32 mx_chan_id);
 #if (SMP_INCLUDED == TRUE)
@@ -231,7 +231,7 @@ BOOLEAN BTM_SecRegister(tBTM_APPL_INFO *p_cb_info)
     BTM_TRACE_EVENT("%s application registered\n", __func__);
 
 #if BLE_INCLUDED == TRUE && SMP_INCLUDED == TRUE
-    LOG_DEBUG("%s p_cb_info->p_le_callback == 0x%p\n", __func__, p_cb_info->p_le_callback);
+    BTM_TRACE_DEBUG("%s p_cb_info->p_le_callback == 0x%p\n", __func__, p_cb_info->p_le_callback);
     if (p_cb_info->p_le_callback) {
         BTM_TRACE_EVENT("%s SMP_Register( btm_proc_smp_cback )\n", __func__);
         SMP_Register(btm_proc_smp_cback);
@@ -240,13 +240,13 @@ BOOLEAN BTM_SecRegister(tBTM_APPL_INFO *p_cb_info)
             btm_ble_reset_id();
         }
     } else {
-        LOG_WARN("%s p_cb_info->p_le_callback == NULL\n", __func__);
+        BTM_TRACE_WARNING("%s p_cb_info->p_le_callback == NULL\n", __func__);
     }
 #endif
 
     btm_cb.api = *p_cb_info;
 #if BLE_INCLUDED == TRUE && SMP_INCLUDED == TRUE
-    LOG_DEBUG("%s btm_cb.api.p_le_callback = 0x%p\n", __func__, btm_cb.api.p_le_callback);
+    BTM_TRACE_DEBUG("%s btm_cb.api.p_le_callback = 0x%p\n", __func__, btm_cb.api.p_le_callback);
 #endif
     BTM_TRACE_EVENT("%s application registered\n", __func__);
     return (TRUE);
@@ -459,7 +459,7 @@ void BTM_SetSecureConnectionsOnly (BOOLEAN secure_connections_only_mode)
 ** Returns          TRUE if registered OK, else FALSE
 **
 *******************************************************************************/
-BOOLEAN BTM_SetSecurityLevel (BOOLEAN is_originator, char *p_name, UINT8 service_id,
+BOOLEAN BTM_SetSecurityLevel (BOOLEAN is_originator, const char *p_name, UINT8 service_id,
                               UINT16 sec_level, UINT16 psm, UINT32 mx_proto_id,
                               UINT32 mx_chan_id)
 {
@@ -499,7 +499,7 @@ BOOLEAN BTM_SetSecurityLevel (BOOLEAN is_originator, char *p_name, UINT8 service
 ** Returns          TRUE if registered OK, else FALSE
 **
 *******************************************************************************/
-static BOOLEAN btm_sec_set_security_level (CONNECTION_TYPE conn_type, char *p_name, UINT8 service_id,
+static BOOLEAN btm_sec_set_security_level (CONNECTION_TYPE conn_type, const char *p_name, UINT8 service_id,
         UINT16 sec_level, UINT16 psm, UINT32 mx_proto_id,
         UINT32 mx_chan_id)
 {
@@ -1361,7 +1361,7 @@ tBTM_STATUS BTM_SetEncryption (BD_ADDR bd_addr, tBT_TRANSPORT transport, tBTM_SE
 
         return (BTM_SUCCESS);
     }
-
+    p_dev_rec->enc_init_by_we = TRUE;
     /* enqueue security request if security is active */
     if (p_dev_rec->p_callback || (p_dev_rec->sec_state != BTM_SEC_STATE_IDLE)) {
         BTM_TRACE_WARNING ("Security Manager: BTM_SetEncryption busy, enqueue request\n");
@@ -2325,7 +2325,7 @@ tBTM_STATUS btm_sec_l2cap_access_req (BD_ADDR bd_addr, UINT16 psm, UINT16 handle
             2046 may report HCI_Encryption_Change and L2C Connection Request out of sequence
             because of data path issues. Delay this disconnect a little bit
             */
-            LOG_INFO("%s peer should have initiated security process by now (SM4 to SM4)\n", __func__);
+            BTM_TRACE_API("%s peer should have initiated security process by now (SM4 to SM4)\n", __func__);
             p_dev_rec->p_callback        = p_callback;
             p_dev_rec->sec_state         = BTM_SEC_STATE_DELAY_FOR_ENC;
             (*p_callback) (bd_addr, transport, p_ref_data, rc);
@@ -2598,7 +2598,6 @@ tBTM_STATUS btm_sec_mx_access_request (BD_ADDR bd_addr, UINT16 psm, BOOLEAN is_o
 void btm_sec_conn_req (UINT8 *bda, UINT8 *dc)
 {
     tBTM_SEC_DEV_REC  *p_dev_rec = btm_find_dev (bda);
-    BTM_TRACE_ERROR ("%s\n", __func__);
     /* Some device may request a connection before we are done with the HCI_Reset sequence */
     if (!controller_get_interface()->get_is_ready()) {
         BTM_TRACE_ERROR ("Security Manager: connect request when device not ready\n");
@@ -2763,9 +2762,8 @@ void btm_sec_check_pending_reqs (void)
         /* Now, re-submit anything in the mux queue */
         bq = btm_cb.sec_pending_q;
 
-        if (!btm_cb.sec_pending_q) {
-            btm_cb.sec_pending_q = fixed_queue_new(SIZE_MAX);
-        }
+        btm_cb.sec_pending_q = fixed_queue_new(QUEUE_SIZE_MAX);
+
 
         while ((p_e = (tBTM_SEC_QUEUE_ENTRY *)fixed_queue_try_dequeue(bq)) != NULL) {
             /* Check that the ACL is still up before starting security procedures */
@@ -2786,6 +2784,7 @@ void btm_sec_check_pending_reqs (void)
 
             osi_free (p_e);
         }
+        fixed_queue_free(bq, NULL);
     }
 }
 #endif  ///SMP_INCLUDED == TRUE
@@ -4210,7 +4209,6 @@ void btm_sec_connected (UINT8 *bda, UINT16 handle, UINT8 status, UINT8 enc_mode)
 
     btm_acl_resubmit_page();
 
-    BTM_TRACE_ERROR ("%s\n", __func__);
     /* Commenting out trace due to obf/compilation problems.
     */
 #if (BT_USE_TRACES == TRUE && SMP_INCLUDED == TRUE)
@@ -4537,7 +4535,7 @@ void btm_sec_disconnected (UINT16 handle, UINT8 reason)
     if (!p_dev_rec) {
         return;
     }
-
+    p_dev_rec->enc_init_by_we = FALSE;
     transport  = (handle == p_dev_rec->hci_handle) ? BT_TRANSPORT_BR_EDR : BT_TRANSPORT_LE;
 
     p_dev_rec->rs_disc_pending = BTM_SEC_RS_NOT_PENDING;     /* reset flag */
@@ -5032,42 +5030,13 @@ void btm_sec_pin_code_request (UINT8 *p_bda)
         memcpy (p_cb->connecting_bda, p_bda, BD_ADDR_LEN);
         memcpy (p_cb->connecting_dc,  p_dev_rec->dev_class, DEV_CLASS_LEN);
 
-        /* Check if the name is known */
-        /* Even if name is not known we might not be able to get one */
-        /* this is the case when we are already getting something from the */
-        /* device, so HCI level is flow controlled */
-        /* Also cannot send remote name request while paging, i.e. connection is not completed */
-        if (p_dev_rec->sec_flags & BTM_SEC_NAME_KNOWN) {
-            BTM_TRACE_EVENT ("btm_sec_pin_code_request going for callback\n");
-
-            btm_cb.pairing_flags |= BTM_PAIR_FLAGS_PIN_REQD;
-            if (p_cb->api.p_pin_callback) {
-                (*p_cb->api.p_pin_callback) (p_bda, p_dev_rec->dev_class, p_dev_rec->sec_bd_name,
-                                             (p_dev_rec->p_cur_service == NULL) ? FALSE
-                                             : (p_dev_rec->p_cur_service->security_flags
-                                                & BTM_SEC_IN_MIN_16_DIGIT_PIN));
-            }
-        } else {
-            BTM_TRACE_EVENT ("btm_sec_pin_code_request going for remote name\n");
-
-            /* We received PIN code request for the device with unknown name */
-            /* it is not user friendly just to ask for the PIN without name */
-            /* try to get name at first */
-            if (!btsnd_hcic_rmt_name_req (p_dev_rec->bd_addr,
-                                          HCI_PAGE_SCAN_REP_MODE_R1,
-                                          HCI_MANDATARY_PAGE_SCAN_MODE, 0)) {
-                p_dev_rec->sec_flags |= BTM_SEC_NAME_KNOWN;
-                p_dev_rec->sec_bd_name[0] = 'f';
-                p_dev_rec->sec_bd_name[1] = '0';
-                BTM_TRACE_ERROR ("can not send rmt_name_req?? fake a name and call callback\n");
-
-                btm_cb.pairing_flags |= BTM_PAIR_FLAGS_PIN_REQD;
-                if (p_cb->api.p_pin_callback)
-                    (*p_cb->api.p_pin_callback) (p_bda, p_dev_rec->dev_class,
-                                                 p_dev_rec->sec_bd_name, (p_dev_rec->p_cur_service == NULL) ? FALSE
-                                                 : (p_dev_rec->p_cur_service->security_flags
-                                                    & BTM_SEC_IN_MIN_16_DIGIT_PIN));
-            }
+        BTM_TRACE_EVENT ("btm_sec_pin_code_request going for callback\n");
+        btm_cb.pairing_flags |= BTM_PAIR_FLAGS_PIN_REQD;
+        if (p_cb->api.p_pin_callback) {
+            (*p_cb->api.p_pin_callback) (p_bda, p_dev_rec->dev_class, p_dev_rec->sec_bd_name,
+                                         (p_dev_rec->p_cur_service == NULL) ? FALSE
+                                         : (p_dev_rec->p_cur_service->security_flags
+                                            & BTM_SEC_IN_MIN_16_DIGIT_PIN));
         }
     }
     return;
@@ -5972,7 +5941,7 @@ static void btm_sec_check_pending_enc_req (tBTM_SEC_DEV_REC  *p_dev_rec, tBT_TRA
                 if (p_e->p_callback) {
                     (*p_e->p_callback) (p_dev_rec->bd_addr, transport, p_e->p_ref_data, res);
                 }
-				
+
 				fixed_queue_try_remove_from_queue(btm_cb.sec_pending_q, (void *)p_e);
             }
         }

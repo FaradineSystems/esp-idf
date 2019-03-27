@@ -52,6 +52,7 @@
 #include "lwip/snmp.h"
 #include "lwip/dhcp.h"
 #include "lwip/autoip.h"
+#include "lwip/netif.h"
 
 #include <string.h>
 
@@ -128,6 +129,22 @@ static u8_t etharp_cached_entry;
 
 
 static err_t etharp_request_dst(struct netif *netif, const ip4_addr_t *ipaddr, const struct eth_addr* hw_dst_addr);
+
+#if ESP_GRATUITOUS_ARP
+
+void garp_tmr(void)
+{
+  struct netif* garp_netif = NULL;
+
+  for (garp_netif = netif_list; garp_netif != NULL; garp_netif = garp_netif->next) {
+    if (netif_is_up(garp_netif) && netif_is_link_up(garp_netif) && !ip4_addr_isany_val(*netif_ip4_addr(garp_netif))) {
+      if ((garp_netif->flags & NETIF_FLAG_ETHARP) && (garp_netif->flags & NETIF_FLAG_GARP)) {
+        etharp_gratuitous(garp_netif);
+      }
+    }
+  }
+}
+#endif
 
 
 #if ARP_QUEUEING
@@ -404,7 +421,7 @@ etharp_find_entry(const ip4_addr_t *ipaddr, u8_t flags, struct netif* netif)
  * @params dst the destination MAC address to be copied into the ethernet header
  * @return ERR_OK if the packet was sent, any other err_t on failure
  */
-static err_t
+static err_t ESP_IRAM_ATTR
 etharp_send_ip(struct netif *netif, struct pbuf *p, struct eth_addr *src, const struct eth_addr *dst)
 {
   struct eth_hdr *ethhdr = (struct eth_hdr *)p->payload;
@@ -872,7 +889,7 @@ etharp_arp_input(struct netif *netif, struct eth_addr *ethaddr, struct pbuf *p)
 /** Just a small helper function that sends a pbuf to an ethernet address
  * in the arp_table specified by the index 'arp_idx'.
  */
-static err_t
+static err_t ESP_IRAM_ATTR
 etharp_output_to_arp_index(struct netif *netif, struct pbuf *q, u8_t arp_idx)
 {
   LWIP_ASSERT("arp_table[arp_idx].state >= ETHARP_STATE_STABLE",
@@ -916,7 +933,7 @@ etharp_output_to_arp_index(struct netif *netif, struct pbuf *q, u8_t arp_idx)
  * - ERR_RTE No route to destination (no gateway to external networks),
  * or the return type of either etharp_query() or etharp_send_ip().
  */
-err_t
+err_t ESP_IRAM_ATTR
 etharp_output(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr)
 {
   const struct eth_addr *dest;

@@ -39,6 +39,10 @@
 #include "esp_pm.h"
 #include "esp_ipc.h"
 #include "driver/periph_ctrl.h"
+#include "soc/rtc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_clk.h"
+
 
 #if CONFIG_BT_ENABLED
 
@@ -50,17 +54,39 @@
 #define BTDM_CFG_BT_DATA_RELEASE            (1<<0)
 #define BTDM_CFG_HCI_UART                   (1<<1)
 #define BTDM_CFG_CONTROLLER_RUN_APP_CPU     (1<<2)
+#define BTDM_CFG_SCAN_DUPLICATE_OPTIONS     (1<<3)
+#define BTDM_CFG_SEND_ADV_RESERVED_SIZE     (1<<4)
 /* Other reserved for future */
 
 /* not for user call, so don't put to include file */
 extern void btdm_osi_funcs_register(void *osi_funcs);
 extern int btdm_controller_init(uint32_t config_mask, esp_bt_controller_config_t *config_opts);
-extern int btdm_controller_deinit(void);
+extern void btdm_controller_deinit(void);
 extern int btdm_controller_enable(esp_bt_mode_t mode);
-extern int btdm_controller_disable(esp_bt_mode_t mode);
+extern void btdm_controller_disable(void);
 extern uint8_t btdm_controller_get_mode(void);
 extern const char *btdm_controller_get_compile_version(void);
-extern void btdm_rf_bb_init(void);
+extern void btdm_rf_bb_init_phase2(void); // shall be called after PHY/RF is enabled
+extern void btdm_controller_enable_sleep(bool enable);
+
+#define BTDM_MODEM_SLEEP_MODE_NONE          (0)
+#define BTDM_MODEM_SLEEP_MODE_ORIG          (1)
+#define BTDM_MODEM_SLEEP_MODE_EVED          (2)
+extern void btdm_controller_set_sleep_mode(uint8_t mode);
+extern uint8_t btdm_controller_get_sleep_mode(void);
+extern bool btdm_power_state_active(void);
+extern void btdm_wakeup_request(void);
+
+#define BTDM_LPCLK_SEL_XTAL      (0)
+#define BTDM_LPCLK_SEL_XTAL32K   (1)
+#define BTDM_LPCLK_SEL_RTC_SLOW  (2)
+#define BTDM_LPCLK_SEL_8M        (3)
+extern bool btdm_lpclk_select_src(uint32_t sel);
+extern bool btdm_lpclk_set_div(uint32_t div);
+
+/* Sleep and wakeup interval control */
+#define BTDM_MIN_SLEEP_DURATION          (12) // threshold of interval in slots to allow to fall into modem sleep
+#define BTDM_MODEM_WAKE_UP_DELAY         (4)  // delay in slots of modem wake up procedure, including re-enable PHY/RF
 
 /* VHCI function interface */
 typedef struct vhci_host_callback {
@@ -74,6 +100,9 @@ extern void API_vhci_host_register_callback(const vhci_host_callback_t *callback
 
 extern int ble_txpwr_set(int power_type, int power_level);
 extern int ble_txpwr_get(int power_type);
+extern int bredr_txpwr_set(int min_power_level, int max_power_level);
+extern int bredr_txpwr_get(int *min_power_level, int *max_power_level);
+extern void bredr_sco_datapath_set(uint8_t data_path);
 
 extern char _bss_start_btdm;
 extern char _bss_end_btdm;
@@ -87,7 +116,7 @@ extern uint32_t _data_end_btdm_rom;
 do{\
     esp_err_t __err = (api_call);\
     if ((ret) != __err) {\
-        BT_DEBUG("%s %d %s ret=%d\n", __FUNCTION__, __LINE__, (info), __err);\
+        BT_DEBUG("%s %d %s ret=0x%X\n", __FUNCTION__, __LINE__, (info), __err);\
         return __err;\
     }\
 } while(0)
@@ -100,9 +129,9 @@ typedef struct {
     intptr_t end;
 } btdm_dram_available_region_t;
 
-/* the mode column will be modifid by release function to indicate the available region */
+/* the mode column will be modified by release function to indicate the available region */
 static btdm_dram_available_region_t btdm_dram_available_region[] = {
-    //following is .data 
+    //following is .data
     {ESP_BT_MODE_BTDM,          0x3ffae6e0, 0x3ffaff10},
     //following is memory which HW will use
     {ESP_BT_MODE_BTDM,          0x3ffb0000, 0x3ffb09a8},
@@ -122,8 +151,8 @@ typedef struct {
     void *buffer;
 } btdm_queue_item_t;
 #define BTDM_MAX_QUEUE_NUM       (5)
-static btdm_queue_item_t btdm_queue_table[BTDM_MAX_QUEUE_NUM];
-SemaphoreHandle_t btdm_queue_table_mux = NULL;
+static DRAM_ATTR btdm_queue_item_t btdm_queue_table[BTDM_MAX_QUEUE_NUM];
+static DRAM_ATTR SemaphoreHandle_t btdm_queue_table_mux = NULL;
 #endif /* #if CONFIG_SPIRAM_USE_MALLOC */
 
 struct osi_funcs_t {
@@ -158,17 +187,45 @@ struct osi_funcs_t {
     int32_t (* _read_efuse_mac)(uint8_t mac[6]);
     void (* _srand)(unsigned int seed);
     int (* _rand)(void);
+    uint32_t (* _btdm_lpcycles_2_us)(uint32_t cycles);
+    uint32_t (* _btdm_us_2_lpcycles)(uint32_t us);
+    bool (* _btdm_sleep_check_duration)(uint32_t *slot_cnt);
+    void (* _btdm_sleep_enter_phase1)(uint32_t lpcycles);  /* called when interrupt is disabled */
+    void (* _btdm_sleep_enter_phase2)(void);
+    void (* _btdm_sleep_exit_phase1)(void);  /* called from ISR */
+    void (* _btdm_sleep_exit_phase2)(void);  /* called from ISR */
+    void (* _btdm_sleep_exit_phase3)(void);  /* called from task */
 };
 
-/* Static variable declare */
-static bool btdm_bb_init_flag = false;
-static esp_bt_controller_status_t btdm_controller_status = ESP_BT_CONTROLLER_STATUS_IDLE;
 
-static portMUX_TYPE global_int_mux = portMUX_INITIALIZER_UNLOCKED;
+/* Static variable declare */
+// timestamp when PHY/RF was switched on
+static DRAM_ATTR int64_t s_time_phy_rf_just_enabled = 0;
+static DRAM_ATTR esp_bt_controller_status_t btdm_controller_status = ESP_BT_CONTROLLER_STATUS_IDLE;
+
+static DRAM_ATTR portMUX_TYPE global_int_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// measured average low power clock period in micro seconds
+static DRAM_ATTR uint32_t btdm_lpcycle_us = 0;
+static DRAM_ATTR uint8_t btdm_lpcycle_us_frac = 0; // number of fractional bit for btdm_lpcycle_us
 
 #ifdef CONFIG_PM_ENABLE
-static esp_pm_lock_handle_t s_pm_lock;
+static DRAM_ATTR esp_timer_handle_t s_btdm_slp_tmr;
+static DRAM_ATTR esp_pm_lock_handle_t s_pm_lock;
+static DRAM_ATTR esp_pm_lock_handle_t s_light_sleep_pm_lock; // pm_lock to prevent light sleep due to incompatibility currently
+static DRAM_ATTR QueueHandle_t s_pm_lock_sem = NULL;
 #endif
+
+static inline void btdm_check_and_init_bb(void)
+{
+    /* init BT-BB if PHY/RF has been switched off since last BT-BB init */
+    int64_t latest_ts = esp_phy_rf_get_on_ts();
+    if (latest_ts != s_time_phy_rf_just_enabled ||
+        s_time_phy_rf_just_enabled == 0) {
+        btdm_rf_bb_init_phase2();
+        s_time_phy_rf_just_enabled = latest_ts;
+    }
+}
 
 #if CONFIG_SPIRAM_USE_MALLOC
 bool IRAM_ATTR btdm_queue_generic_register(const btdm_queue_item_t *queue)
@@ -218,12 +275,20 @@ bool IRAM_ATTR btdm_queue_generic_deregister(btdm_queue_item_t *queue)
 
 static void IRAM_ATTR interrupt_disable(void)
 {
-    portENTER_CRITICAL(&global_int_mux);
+    if (xPortInIsrContext()) {
+        portENTER_CRITICAL_ISR(&global_int_mux);
+    } else {
+        portENTER_CRITICAL(&global_int_mux);
+    }
 }
 
 static void IRAM_ATTR interrupt_restore(void)
 {
-    portEXIT_CRITICAL(&global_int_mux);
+    if (xPortInIsrContext()) {
+        portEXIT_CRITICAL_ISR(&global_int_mux);
+    } else {
+        portEXIT_CRITICAL(&global_int_mux);
+    }
 }
 
 static void IRAM_ATTR task_yield_from_isr(void)
@@ -537,7 +602,110 @@ static int IRAM_ATTR rand_wrapper(void)
     return (int)esp_random();
 }
 
-static struct osi_funcs_t osi_funcs = {
+static uint32_t IRAM_ATTR btdm_lpcycles_2_us(uint32_t cycles)
+{
+    // The number of lp cycles should not lead to overflow. Thrs: 100s
+    // clock measurement is conducted
+    uint64_t us = (uint64_t)btdm_lpcycle_us * cycles;
+    us = (us + (1 << (btdm_lpcycle_us_frac - 1))) >> btdm_lpcycle_us_frac;
+    return (uint32_t)us;
+}
+
+/*
+ * @brief Converts a duration in slots into a number of low power clock cycles.
+ */
+static uint32_t IRAM_ATTR btdm_us_2_lpcycles(uint32_t us)
+{
+    // The number of sleep duration(us) should not lead to overflow. Thrs: 100s
+    // Compute the sleep duration in us to low power clock cycles, with calibration result applied
+    // clock measurement is conducted
+    uint64_t cycles = ((uint64_t)(us) << btdm_lpcycle_us_frac) / btdm_lpcycle_us;
+
+    return (uint32_t)cycles;
+}
+
+static bool IRAM_ATTR btdm_sleep_check_duration(uint32_t *slot_cnt)
+{
+    if (*slot_cnt < BTDM_MIN_SLEEP_DURATION) {
+        return false;
+    }
+    /* wake up in advance considering the delay in enabling PHY/RF */
+    *slot_cnt -= BTDM_MODEM_WAKE_UP_DELAY;
+    return true;
+}
+
+static void btdm_sleep_enter_phase1_wrapper(uint32_t lpcycles)
+{
+#ifdef CONFIG_PM_ENABLE
+    // start a timer to wake up and acquire the pm_lock before modem_sleep awakes
+    uint32_t us_to_sleep = btdm_lpcycles_2_us(lpcycles);
+
+#define BTDM_MIN_TIMER_UNCERTAINTY_US      (1800)
+    assert(us_to_sleep > BTDM_MIN_TIMER_UNCERTAINTY_US);
+    // allow a maximum time uncertainty to be about 488ppm(1/2048) at least as clock drift
+    // and set the timer in advance
+    uint32_t uncertainty = (us_to_sleep >> 11);
+    if (uncertainty < BTDM_MIN_TIMER_UNCERTAINTY_US) {
+        uncertainty = BTDM_MIN_TIMER_UNCERTAINTY_US;
+    }
+
+    if (esp_timer_start_once(s_btdm_slp_tmr, us_to_sleep - uncertainty) != ESP_OK) {
+        ESP_LOGW(BTDM_LOG_TAG, "timer start failed");
+    }
+#endif
+}
+
+static void btdm_sleep_enter_phase2_wrapper(void)
+{
+    if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG) {
+        esp_modem_sleep_enter(MODEM_BLE_MODULE);
+        esp_modem_sleep_enter(MODEM_CLASSIC_BT_MODULE);
+#ifdef CONFIG_PM_ENABLE
+        esp_pm_lock_release(s_pm_lock);
+        semphr_give_wrapper(s_pm_lock_sem);
+#endif
+    } else if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_EVED) {
+        esp_modem_sleep_enter(MODEM_BLE_MODULE);
+        // pause bluetooth baseband
+        periph_module_disable(PERIPH_BT_BASEBAND_MODULE);
+    }
+}
+
+static void IRAM_ATTR btdm_sleep_exit_phase1_wrapper(void)
+{
+#ifdef CONFIG_PM_ENABLE
+    if (semphr_take_from_isr_wrapper(s_pm_lock_sem, NULL) == pdTRUE) {
+        esp_pm_lock_acquire(s_pm_lock);
+    }
+#endif
+}
+
+static void btdm_sleep_exit_phase3_wrapper(void)
+{
+    if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG) {
+        esp_modem_sleep_exit(MODEM_BLE_MODULE);
+        esp_modem_sleep_exit(MODEM_CLASSIC_BT_MODULE);
+        btdm_check_and_init_bb();
+#ifdef CONFIG_PM_ENABLE
+        esp_timer_stop(s_btdm_slp_tmr);
+#endif
+    } else if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_EVED) {
+        // resume bluetooth baseband
+        periph_module_enable(PERIPH_BT_BASEBAND_MODULE);
+        esp_modem_sleep_exit(MODEM_BLE_MODULE);
+    }
+}
+
+#ifdef CONFIG_PM_ENABLE
+static void IRAM_ATTR btdm_slp_tmr_callback(void *arg)
+{
+    if (semphr_take_wrapper(s_pm_lock_sem, 0) == pdTRUE) {
+        esp_pm_lock_acquire(s_pm_lock);
+    }
+}
+#endif
+
+static DRAM_ATTR struct osi_funcs_t osi_funcs = {
     ._set_isr = xt_set_interrupt_handler,
     ._ints_on = xt_ints_on,
     ._interrupt_disable = interrupt_disable,
@@ -569,6 +737,14 @@ static struct osi_funcs_t osi_funcs = {
     ._read_efuse_mac = read_mac_wrapper,
     ._srand = srand_wrapper,
     ._rand = rand_wrapper,
+    ._btdm_lpcycles_2_us = btdm_lpcycles_2_us,
+    ._btdm_us_2_lpcycles = btdm_us_2_lpcycles,
+    ._btdm_sleep_check_duration = btdm_sleep_check_duration,
+    ._btdm_sleep_enter_phase1 = btdm_sleep_enter_phase1_wrapper,
+    ._btdm_sleep_enter_phase2 = btdm_sleep_enter_phase2_wrapper,
+    ._btdm_sleep_exit_phase1 = btdm_sleep_exit_phase1_wrapper,
+    ._btdm_sleep_exit_phase2 = NULL,
+    ._btdm_sleep_exit_phase3 = btdm_sleep_exit_phase3_wrapper,
 };
 
 bool esp_vhci_host_check_send_available(void)
@@ -578,6 +754,15 @@ bool esp_vhci_host_check_send_available(void)
 
 void esp_vhci_host_send_packet(uint8_t *data, uint16_t len)
 {
+    if (!btdm_power_state_active()) {
+#if CONFIG_PM_ENABLE
+        if (semphr_take_wrapper(s_pm_lock_sem, 0)) {
+            esp_pm_lock_acquire(s_pm_lock);
+        }
+        esp_timer_stop(s_btdm_slp_tmr);
+#endif
+        btdm_wakeup_request();
+    }
     API_vhci_host_send_packet(data, len);
 }
 
@@ -600,6 +785,10 @@ static uint32_t btdm_config_mask_load(void)
 #if CONFIG_BTDM_CONTROLLER_PINNED_TO_CORE == 1
     mask |= BTDM_CFG_CONTROLLER_RUN_APP_CPU;
 #endif
+    mask |= BTDM_CFG_SCAN_DUPLICATE_OPTIONS;
+
+    mask |= BTDM_CFG_SEND_ADV_RESERVED_SIZE;
+
     return mask;
 }
 
@@ -626,7 +815,7 @@ esp_err_t esp_bt_controller_mem_release(esp_bt_mode_t mode)
         return ESP_ERR_INVALID_STATE;
     }
 
-    //already relesed
+    //already released
     if (!(mode & btdm_dram_available_region[0].mode)) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -673,7 +862,7 @@ esp_err_t esp_bt_controller_mem_release(esp_bt_mode_t mode)
 
 esp_err_t esp_bt_controller_init(esp_bt_controller_config_t *cfg)
 {
-    BaseType_t ret;
+    esp_err_t err;
     uint32_t btdm_cfg_mask = 0;
 
     if (btdm_controller_status != ESP_BT_CONTROLLER_STATUS_IDLE) {
@@ -694,25 +883,37 @@ esp_err_t esp_bt_controller_init(esp_bt_controller_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
 
-#ifdef CONFIG_PM_ENABLE
-    esp_err_t err = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "bt", &s_pm_lock);
-    if (err != ESP_OK) {
-        return err;
-    }
-#endif
-
     ESP_LOGI(BTDM_LOG_TAG, "BT controller compile version [%s]\n", btdm_controller_get_compile_version());
 
 #if CONFIG_SPIRAM_USE_MALLOC
     btdm_queue_table_mux = xSemaphoreCreateMutex();
-    if (btdm_queue_table == NULL) {
-#ifdef CONFIG_PM_ENABLE
-        esp_pm_lock_delete(s_pm_lock);
-        s_pm_lock = NULL;
-#endif
+    if (btdm_queue_table_mux == NULL) {
         return ESP_ERR_NO_MEM;
     }
     memset(btdm_queue_table, 0, sizeof(btdm_queue_item_t) * BTDM_MAX_QUEUE_NUM);
+#endif
+
+#ifdef CONFIG_PM_ENABLE
+    if ((err = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "btLS", &s_light_sleep_pm_lock)) != ESP_OK) {
+        goto error;
+    }
+    if ((err = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "bt", &s_pm_lock)) != ESP_OK) {
+        goto error;
+    }
+    esp_timer_create_args_t create_args = {
+        .callback = btdm_slp_tmr_callback,
+        .arg = NULL,
+        .name = "btSlp"
+    };
+    if ((err = esp_timer_create(&create_args, &s_btdm_slp_tmr)) != ESP_OK) {
+        goto error;
+    }
+
+    s_pm_lock_sem = semphr_create_wrapper(1, 0);
+    if (s_pm_lock_sem == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto error;
+    }
 #endif
 
     btdm_osi_funcs_register(&osi_funcs);
@@ -721,19 +922,62 @@ esp_err_t esp_bt_controller_init(esp_bt_controller_config_t *cfg)
 
     periph_module_enable(PERIPH_BT_MODULE);
 
+    btdm_lpcycle_us_frac = RTC_CLK_CAL_FRACT;
+    btdm_lpcycle_us = 32 << btdm_lpcycle_us_frac;
+#if CONFIG_BTDM_MODEM_SLEEP_MODE_ORIG
+    bool select_src_ret = false;
+    bool set_div_ret = false;
+#if CONFIG_BTDM_LPCLK_SEL_MAIN_XTAL
+    select_src_ret = btdm_lpclk_select_src(BTDM_LPCLK_SEL_XTAL);
+    set_div_ret = btdm_lpclk_set_div(rtc_clk_xtal_freq_get() * 2 - 1);
+    assert(select_src_ret && set_div_ret);
+    btdm_lpcycle_us_frac = RTC_CLK_CAL_FRACT;
+    btdm_lpcycle_us = 2 << btdm_lpcycle_us_frac;
+#elif CONFIG_BTDM_LPCLK_SEL_EXT_32K_XTAL
+    select_src_ret = btdm_lpclk_select_src(BTDM_LPCLK_SEL_XTAL32K);
+    set_div_ret = btdm_lpclk_set_div(0);
+    assert(select_src_ret && set_div_ret);
+    btdm_lpcycle_us_frac = RTC_CLK_CAL_FRACT;
+    btdm_lpcycle_us = esp_clk_slowclk_cal_get();
+    assert(btdm_lpcycle_us != 0);
+#endif // CONFIG_BTDM_LPCLK_SEL_XX
+    btdm_controller_set_sleep_mode(BTDM_MODEM_SLEEP_MODE_ORIG);
+#elif CONFIG_BTDM_MODEM_SLEEP_MODE_EVED
+    btdm_controller_set_sleep_mode(BTDM_MODEM_SLEEP_MODE_EVED);
+#else
+    btdm_controller_set_sleep_mode(BTDM_MODEM_SLEEP_MODE_NONE);
+#endif
+
     btdm_cfg_mask = btdm_config_mask_load();
 
-    ret = btdm_controller_init(btdm_cfg_mask, cfg);
-    if (ret) {
-#ifdef CONFIG_PM_ENABLE
-        esp_pm_lock_delete(s_pm_lock);
-        s_pm_lock = NULL;
-#endif
-        return ESP_ERR_NO_MEM;
+    if (btdm_controller_init(btdm_cfg_mask, cfg) != 0) {
+        err = ESP_ERR_NO_MEM;
+        goto error;
     }
 
     btdm_controller_status = ESP_BT_CONTROLLER_STATUS_INITED;
+
     return ESP_OK;
+error:
+#ifdef CONFIG_PM_ENABLE
+    if (s_light_sleep_pm_lock != NULL) {
+        esp_pm_lock_delete(s_light_sleep_pm_lock);
+        s_light_sleep_pm_lock = NULL;
+    }
+    if (s_pm_lock != NULL) {
+        esp_pm_lock_delete(s_pm_lock);
+        s_pm_lock = NULL;
+    }
+    if (s_btdm_slp_tmr != NULL) {
+        esp_timer_delete(s_btdm_slp_tmr);
+        s_btdm_slp_tmr = NULL;
+    }
+    if (s_pm_lock_sem) {
+        semphr_delete_wrapper(s_pm_lock_sem);
+        s_pm_lock_sem = NULL;
+    }
+#endif
+    return err;
 }
 
 esp_err_t esp_bt_controller_deinit(void)
@@ -742,11 +986,21 @@ esp_err_t esp_bt_controller_deinit(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (btdm_controller_deinit() != 0) {
-        return ESP_ERR_NO_MEM;
-    }
+    btdm_controller_deinit();
 
     periph_module_disable(PERIPH_BT_MODULE);
+
+#ifdef CONFIG_PM_ENABLE
+    esp_pm_lock_delete(s_light_sleep_pm_lock);
+    s_light_sleep_pm_lock = NULL;
+    esp_pm_lock_delete(s_pm_lock);
+    s_pm_lock = NULL;
+    esp_timer_stop(s_btdm_slp_tmr);
+    esp_timer_delete(s_btdm_slp_tmr);
+    s_btdm_slp_tmr = NULL;
+    semphr_delete_wrapper(s_pm_lock_sem);
+    s_pm_lock_sem = NULL;
+#endif
 
 #if CONFIG_SPIRAM_USE_MALLOC
     vSemaphoreDelete(btdm_queue_table_mux);
@@ -756,10 +1010,8 @@ esp_err_t esp_bt_controller_deinit(void)
 
     btdm_controller_status = ESP_BT_CONTROLLER_STATUS_IDLE;
 
-#ifdef CONFIG_PM_ENABLE
-    esp_pm_lock_delete(s_pm_lock);
-    s_pm_lock = NULL;
-#endif
+    btdm_lpcycle_us = 0;
+    btdm_controller_set_sleep_mode(BTDM_MODEM_SLEEP_MODE_NONE);
 
     return ESP_OK;
 }
@@ -778,18 +1030,47 @@ esp_err_t esp_bt_controller_enable(esp_bt_mode_t mode)
     }
 
 #ifdef CONFIG_PM_ENABLE
+    esp_pm_lock_acquire(s_light_sleep_pm_lock);
     esp_pm_lock_acquire(s_pm_lock);
 #endif
 
-    esp_phy_load_cal_and_init();
+    esp_phy_load_cal_and_init(PHY_BT_MODULE);
 
-    if (btdm_bb_init_flag == false) {
-        btdm_bb_init_flag = true;
-        btdm_rf_bb_init();  /* only initialise once */
+    if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_NONE) {
+        //Just register to sleep module, make the modem sleep modules check BT sleep status when sleep enter.
+        //Thus, it will prevent WIFI from disabling RF when BT is not in sleep but is using RF.
+        esp_modem_sleep_register(MODEM_BLE_MODULE);
+        esp_modem_sleep_register(MODEM_CLASSIC_BT_MODULE);
+        esp_modem_sleep_exit(MODEM_BLE_MODULE);
+        esp_modem_sleep_exit(MODEM_CLASSIC_BT_MODULE);
+    } else if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG) {
+        esp_modem_sleep_register(MODEM_BLE_MODULE);
+        esp_modem_sleep_register(MODEM_CLASSIC_BT_MODULE);
+    } else if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_EVED) {
+        esp_modem_sleep_register(MODEM_BLE_MODULE);
     }
+
+    if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG) {
+        btdm_controller_enable_sleep(true);
+    }
+
+    // inititalize bluetooth baseband
+    btdm_check_and_init_bb();
 
     ret = btdm_controller_enable(mode);
     if (ret) {
+        if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_NONE
+                || btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG) {
+            esp_modem_sleep_deregister(MODEM_BLE_MODULE);
+            esp_modem_sleep_deregister(MODEM_CLASSIC_BT_MODULE);
+        } else if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_EVED) {
+            esp_modem_sleep_deregister(MODEM_BLE_MODULE);
+        }
+        esp_phy_rf_deinit(PHY_BT_MODULE);
+#ifdef CONFIG_PM_ENABLE
+        esp_pm_lock_release(s_light_sleep_pm_lock);
+        esp_pm_lock_release(s_pm_lock);
+#endif
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -800,23 +1081,35 @@ esp_err_t esp_bt_controller_enable(esp_bt_mode_t mode)
 
 esp_err_t esp_bt_controller_disable(void)
 {
-    int ret;
-
     if (btdm_controller_status != ESP_BT_CONTROLLER_STATUS_ENABLED) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    ret = btdm_controller_disable(btdm_controller_get_mode());
-    if (ret < 0) {
-        return ESP_ERR_INVALID_STATE;
+    // disable modem sleep and wake up from sleep mode
+    if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG) {
+        btdm_controller_enable_sleep(false);
+        if (!btdm_power_state_active()) {
+            btdm_wakeup_request();
+        }
+        while (!btdm_power_state_active()) {
+            ets_delay_us(1000);
+        }
     }
 
-    if (ret == ESP_BT_MODE_IDLE) {
-        esp_phy_rf_deinit();
-        btdm_controller_status = ESP_BT_CONTROLLER_STATUS_INITED;
+    btdm_controller_disable();
+
+    if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_NONE
+            || btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG) {
+        esp_modem_sleep_deregister(MODEM_BLE_MODULE);
+        esp_modem_sleep_deregister(MODEM_CLASSIC_BT_MODULE);
+    } else if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_EVED) {
+        esp_modem_sleep_deregister(MODEM_BLE_MODULE);
     }
+    esp_phy_rf_deinit(PHY_BT_MODULE);
+    btdm_controller_status = ESP_BT_CONTROLLER_STATUS_INITED;
 
 #ifdef CONFIG_PM_ENABLE
+    esp_pm_lock_release(s_light_sleep_pm_lock);
     esp_pm_lock_release(s_pm_lock);
 #endif
 
@@ -842,6 +1135,106 @@ esp_err_t esp_ble_tx_power_set(esp_ble_power_type_t power_type, esp_power_level_
 esp_power_level_t esp_ble_tx_power_get(esp_ble_power_type_t power_type)
 {
     return (esp_power_level_t)ble_txpwr_get(power_type);
+}
+
+esp_err_t esp_bredr_tx_power_set(esp_power_level_t min_power_level, esp_power_level_t max_power_level)
+{
+    esp_err_t err;
+    int ret;
+
+    ret = bredr_txpwr_set(min_power_level, max_power_level);
+
+    if (ret == 0) {
+        err = ESP_OK;
+    } else if (ret == -1) {
+        err = ESP_ERR_INVALID_ARG;
+    } else {
+        err = ESP_ERR_INVALID_STATE;
+    }
+
+    return err;
+}
+
+esp_err_t esp_bredr_tx_power_get(esp_power_level_t *min_power_level, esp_power_level_t *max_power_level)
+{
+    if (bredr_txpwr_get((int *)min_power_level, (int *)max_power_level) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t esp_bt_sleep_enable (void)
+{
+    esp_err_t status;
+    if (btdm_controller_status != ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG) {
+        esp_modem_sleep_register(MODEM_BLE_MODULE);
+        esp_modem_sleep_register(MODEM_CLASSIC_BT_MODULE);
+        btdm_controller_enable_sleep (true);
+        status = ESP_OK;
+    } else if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_EVED) {
+        esp_modem_sleep_register(MODEM_BLE_MODULE);
+        btdm_controller_enable_sleep (true);
+        status = ESP_OK;
+    } else {
+        status = ESP_ERR_NOT_SUPPORTED;
+    }
+
+    return status;
+}
+
+esp_err_t esp_bt_sleep_disable (void)
+{
+    esp_err_t status;
+    if (btdm_controller_status != ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_ORIG) {
+        esp_modem_sleep_deregister(MODEM_BLE_MODULE);
+        esp_modem_sleep_deregister(MODEM_CLASSIC_BT_MODULE);
+        btdm_controller_enable_sleep (false);
+        status = ESP_OK;
+    } else if (btdm_controller_get_sleep_mode() == BTDM_MODEM_SLEEP_MODE_EVED) {
+        esp_modem_sleep_deregister(MODEM_BLE_MODULE);
+        btdm_controller_enable_sleep (false);
+        status = ESP_OK;
+    } else {
+        status = ESP_ERR_NOT_SUPPORTED;
+    }
+
+    return status;
+}
+
+bool esp_bt_controller_is_sleeping(void)
+{
+    if (btdm_controller_status != ESP_BT_CONTROLLER_STATUS_ENABLED ||
+        btdm_controller_get_sleep_mode() != BTDM_MODEM_SLEEP_MODE_ORIG) {
+        return false;
+    }
+
+    return !btdm_power_state_active();
+}
+
+void esp_bt_controller_wakeup_request(void)
+{
+    if (btdm_controller_status != ESP_BT_CONTROLLER_STATUS_ENABLED ||
+        btdm_controller_get_sleep_mode() != BTDM_MODEM_SLEEP_MODE_ORIG) {
+        return;
+    }
+
+    btdm_wakeup_request();
+}
+
+esp_err_t esp_bredr_sco_datapath_set(esp_sco_data_path_t data_path)
+{
+    if (btdm_controller_status != ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    bredr_sco_datapath_set(data_path);
+    return ESP_OK;
 }
 
 #endif /*  CONFIG_BT_ENABLED */

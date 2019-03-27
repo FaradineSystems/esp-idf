@@ -138,7 +138,8 @@ typedef struct {
     int                     intr_alloc_flags;       /*!< Flags used to allocate the interrupt. One or multiple (ORred) ESP_INTR_FLAG_* values. See esp_intr_alloc.h for more info */
     int                     dma_buf_count;          /*!< I2S DMA Buffer Count */
     int                     dma_buf_len;            /*!< I2S DMA Buffer Length */
-    int                     use_apll;               /*!< I2S using APLL as main I2S clock, enable it to get accurate clock */
+    bool                    use_apll;              /*!< I2S using APLL as main I2S clock, enable it to get accurate clock */
+    int                     fixed_mclk;             /*!< I2S using fixed MCLK output. If use_apll = true and fixed_mclk > 0, then the clock output for i2s is fixed and equal to the fixed_mclk value.*/
 } i2s_config_t;
 
 /**
@@ -477,13 +478,37 @@ esp_err_t i2s_set_clk(i2s_port_t i2s_num, uint32_t rate, i2s_bits_per_sample_t b
 /**
  * @brief Set built-in ADC mode for I2S DMA, this function will initialize ADC pad,
  *        and set ADC parameters.
- * @param adc_unit  SAR ADC unit index
+ * @param adc_unit    SAR ADC unit index
  * @param adc_channel ADC channel index
  * @return
  *     - ESP_OK              Success
  *     - ESP_ERR_INVALID_ARG Parameter error
  */
 esp_err_t i2s_set_adc_mode(adc_unit_t adc_unit, adc1_channel_t adc_channel);
+
+/**
+ * @brief Start to use I2S built-in ADC mode
+ * @note This function would acquire the lock of ADC to prevent the data getting corrupted
+ *       during the I2S peripheral is being used to do fully continuous ADC sampling.
+ *
+ * @param i2s_num i2s port index
+ * @return
+ *     - ESP_OK                Success
+ *     - ESP_ERR_INVALID_ARG   Parameter error
+ *     - ESP_ERR_INVALID_STATE Driver state error
+ */
+esp_err_t i2s_adc_enable(i2s_port_t i2s_num);
+
+/**
+ * @brief Stop to use I2S built-in ADC mode
+ * @param i2s_num i2s port index
+ * @note This function would release the lock of ADC so that other tasks can use ADC.
+ * @return
+ *     - ESP_OK                 Success
+ *     - ESP_ERR_INVALID_ARG    Parameter error
+ *     - ESP_ERR_INVALID_STATE  Driver state error
+ */
+esp_err_t i2s_adc_disable(i2s_port_t i2s_num);
 
 #ifdef __cplusplus
 }

@@ -72,7 +72,7 @@ sys_mutex_new(sys_mutex_t *pxMutex)
 
 /** Lock a mutex
  * @param mutex the mutex to lock */
-void
+void ESP_IRAM_ATTR
 sys_mutex_lock(sys_mutex_t *pxMutex)
 {
   while (xSemaphoreTake(*pxMutex, portMAX_DELAY) != pdPASS);
@@ -87,7 +87,7 @@ sys_mutex_trylock(sys_mutex_t *pxMutex)
 
 /** Unlock a mutex
  * @param mutex the mutex to unlock */
-void
+void ESP_IRAM_ATTR
 sys_mutex_unlock(sys_mutex_t *pxMutex)
 {
   xSemaphoreGive(*pxMutex);
@@ -127,10 +127,19 @@ sys_sem_new(sys_sem_t *sem, u8_t count)
 
 /*-----------------------------------------------------------------------------------*/
 // Signals a semaphore
-void
+void ESP_IRAM_ATTR
 sys_sem_signal(sys_sem_t *sem)
 {
     xSemaphoreGive(*sem);
+}
+
+/*-----------------------------------------------------------------------------------*/
+// Signals a semaphore (from ISR)
+int sys_sem_signal_isr(sys_sem_t *sem)
+{
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(*sem, &woken);
+    return woken == pdTRUE;
 }
 
 /*-----------------------------------------------------------------------------------*/
@@ -149,7 +158,7 @@ sys_sem_signal(sys_sem_t *sem)
   Notice that lwIP implements a function with a similar name,
   sys_sem_wait(), that uses the sys_arch_sem_wait() function.
 */
-u32_t
+u32_t ESP_IRAM_ATTR
 sys_arch_sem_wait(sys_sem_t *sem, u32_t timeout)
 {
   portTickType StartTime, EndTime, Elapsed;
@@ -213,29 +222,24 @@ sys_mbox_new(sys_mbox_t *mbox, int size)
     return ERR_MEM;
   }
 
-  if (sys_mutex_new(&((*mbox)->lock)) != ERR_OK){
-    LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("fail to new *mbox->lock\n"));
-    vQueueDelete((*mbox)->os_mbox);
-    free(*mbox);
-    return ERR_MEM;
-  }
+#if ESP_THREAD_SAFE
+  (*mbox)->owner = NULL;
+#endif
 
-  (*mbox)->alive = true;
-
-  LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("new *mbox ok mbox=%p os_mbox=%p mbox_lock=%p\n", *mbox, (*mbox)->os_mbox, (*mbox)->lock));
+  LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("new *mbox ok mbox=%p os_mbox=%p\n", *mbox, (*mbox)->os_mbox));
   return ERR_OK;
 }
 
 /*-----------------------------------------------------------------------------------*/
 //   Posts the "msg" to the mailbox.
-void
+void ESP_IRAM_ATTR
 sys_mbox_post(sys_mbox_t *mbox, void *msg)
 {
   while (xQueueSendToBack((*mbox)->os_mbox, &msg, portMAX_DELAY) != pdTRUE);
 }
 
 /*-----------------------------------------------------------------------------------*/
-err_t
+err_t ESP_IRAM_ATTR
 sys_mbox_trypost(sys_mbox_t *mbox, void *msg)
 {
   err_t xReturn;
@@ -266,7 +270,7 @@ sys_mbox_trypost(sys_mbox_t *mbox, void *msg)
   Note that a function with a similar name, sys_mbox_fetch(), is
   implemented by lwIP.
 */
-u32_t
+u32_t ESP_IRAM_ATTR
 sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout)
 {
   void *dummyptr;
@@ -280,42 +284,17 @@ sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout)
 
   if (*mbox == NULL){
     *msg = NULL;
-    LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_arch_mbox_fetch: null mbox\n"));
     return -1;
   }
 
-  sys_mutex_lock(&(*mbox)->lock);
+  if (timeout == 0) {
+    timeout = portMAX_DELAY;
+  } else {
+    timeout = timeout / portTICK_PERIOD_MS;
+  }
 
-  if (timeout != 0) {
-    if (pdTRUE == xQueueReceive((*mbox)->os_mbox, &(*msg), timeout / portTICK_PERIOD_MS)) {
-      EndTime = xTaskGetTickCount();
-      Elapsed = (EndTime - StartTime) * portTICK_PERIOD_MS;
-
-      if (Elapsed == 0) {
-        Elapsed = 1;
-      }
-
-      ulReturn = Elapsed;
-    } else { // timed out blocking for message
-      *msg = NULL;
-      ulReturn = SYS_ARCH_TIMEOUT;
-    }
-  } else { // block forever for a message.
-    
-    while (1){
-      LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_arch_mbox_fetch: fetch mbox=%p os_mbox=%p lock=%p\n", mbox, (*mbox)->os_mbox, (*mbox)->lock));
-      if (pdTRUE == xQueueReceive((*mbox)->os_mbox, &(*msg), portMAX_DELAY)){
-        LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_arch_mbox_fetch:mbox rx msg=%p\n", (*msg)));
-        break;
-      }
-
-      if ((*mbox)->alive == false){
-        LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_arch_mbox_fetch:mbox not alive\n"));
-        *msg = NULL;
-        break;
-      }
-    }
-
+  *msg = NULL;
+  if (pdTRUE == xQueueReceive((*mbox)->os_mbox, &(*msg), timeout)) {
     EndTime = xTaskGetTickCount();
     Elapsed = (EndTime - StartTime) * portTICK_PERIOD_MS;
 
@@ -324,9 +303,9 @@ sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout)
     }
 
     ulReturn = Elapsed;
+  } else { // timed out blocking for message
+    ulReturn = SYS_ARCH_TIMEOUT;
   }
-
-  sys_mutex_unlock(&(*mbox)->lock);
 
   return ulReturn ; // return time blocked TBD test
 }
@@ -352,6 +331,16 @@ sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 }
 
 /*-----------------------------------------------------------------------------------*/
+
+void
+sys_mbox_set_owner(sys_mbox_t *mbox, void* owner)
+{
+  if (mbox && *mbox) {
+    (*mbox)->owner = owner;
+    LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("set mbox=%p owner=%p", *mbox, owner));
+  }
+}
+
 /*
   Deallocates a mailbox. If there are messages still present in the
   mailbox when the mailbox is deallocated, it is an indication of a
@@ -360,51 +349,53 @@ sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 void
 sys_mbox_free(sys_mbox_t *mbox)
 {
-#define MAX_POLL_CNT 100
-#define PER_POLL_DELAY 20
-  uint16_t count = 0;
-  bool post_null = true;
+  uint32_t mbox_message_num = 0;
 
-  LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_mbox_free: set alive false\n"));
-  (*mbox)->alive = false;
+  if ( (NULL == mbox) || (NULL == *mbox) ) {
+      return;
+  }
 
-  while ( count++ < MAX_POLL_CNT ){ //ESP32_WORKAROUND
-    LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_mbox_free:try lock=%d\n", count));
-    if (!sys_mutex_trylock( &(*mbox)->lock )){
-      LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_mbox_free:get lock ok %d\n", count));
-      sys_mutex_unlock( &(*mbox)->lock );
-      break;
-    }
+  mbox_message_num = uxQueueMessagesWaiting((*mbox)->os_mbox);
 
-    if (post_null){
-      LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_mbox_free: post null to mbox\n"));
-      if (sys_mbox_trypost( mbox, NULL) != ERR_OK){
-        ESP_STATS_DROP_INC(esp.free_mbox_post_fail);
-        LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_mbox_free: post null mbox fail\n"));
+  LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("mbox free: mbox=%p os_mbox=%p owner=%p msg_num=%d\n", 
+              *mbox, (*mbox)->os_mbox, (*mbox)->owner, mbox_message_num));
+
+#if ESP_THREAD_SAFE
+  if ((*mbox)->owner) {
+    if (0 == mbox_message_num) {
+      /*
+       * If mbox->owner is not NULL, it indicates the mbox is recvmbox or acceptmbox,
+       * we need to post a NULL message to mbox in case some application tasks are blocked
+       * on this mbox
+       */
+      if (sys_mbox_trypost(mbox, NULL) != ERR_OK) {
+        /* Should never be here because post a message to empty mbox should always be successful */
+        ESP_LOGW(TAG, "WARNING: failed to post NULL msg to mbox\n");
       } else {
-        post_null = false;
-        LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_mbox_free: post null mbox ok\n"));
+        LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("mbox free: post null successfully\n"));
       }
     }
-
-    if (count == (MAX_POLL_CNT-1)){
-      ESP_LOGW(TAG, "WARNING: mbox %p had a consumer who never unblocked. Leaking!\n", (*mbox)->os_mbox);
+    (*mbox)->owner = NULL;
+  } else {
+    if (mbox_message_num > 1) {
+      ESP_LOGW(TAG, "WARNING: mbox has %d message, potential memory leaking\n", mbox_message_num);
     }
-    sys_delay_ms(PER_POLL_DELAY);
+
+    if (mbox_message_num > 0) {
+      LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("mbox free: reset mbox queue\n"));
+      xQueueReset((*mbox)->os_mbox); 
+    }
+
+    /* For recvmbox or acceptmbox, free them in netconn_free() when all sockets' API are returned */
+    vQueueDelete((*mbox)->os_mbox);
+    free(*mbox);
+    *mbox = NULL;
   }
-
-  LWIP_DEBUGF(ESP_THREAD_SAFE_DEBUG, ("sys_mbox_free:free mbox\n"));
-
-  if (uxQueueMessagesWaiting((*mbox)->os_mbox)) {
-    xQueueReset((*mbox)->os_mbox);
-    /* Line for breakpoint.  Should never break here! */
-    __asm__ volatile ("nop");
-  }
-
+#else
   vQueueDelete((*mbox)->os_mbox);
-  sys_mutex_free(&(*mbox)->lock);
   free(*mbox);
   *mbox = NULL;
+#endif
 }
 
 /*-----------------------------------------------------------------------------------*/

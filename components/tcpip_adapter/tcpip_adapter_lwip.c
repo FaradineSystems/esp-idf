@@ -26,6 +26,7 @@
 #include "lwip/ip6_addr.h"
 #include "lwip/nd6.h"
 #include "lwip/priv/tcpip_priv.h"
+#include "lwip/netif.h"
 #if LWIP_DNS /* don't build if not configured for use in lwipopts.h */
 #include "lwip/dns.h"
 #endif
@@ -67,7 +68,7 @@ static sys_sem_t api_sync_sem = NULL;
 static bool tcpip_inited = false;
 static sys_sem_t api_lock_sem = NULL;
 extern sys_thread_t g_lwip_task;
-#define TAG "tcpip_adapter"
+static const char* TAG = "tcpip_adapter";
 
 static void tcpip_adapter_api_cb(void* api_msg)
 {
@@ -79,10 +80,19 @@ static void tcpip_adapter_api_cb(void* api_msg)
     }
 
     msg->ret = msg->api_fn(msg);
-    ESP_LOGD(TAG, "call api in lwip: ret=0x%x, give sem", msg->ret);
+    ESP_LOGV(TAG, "call api in lwip: ret=0x%x, give sem", msg->ret);
     sys_sem_signal(&api_sync_sem);
 
     return;
+}
+
+static void tcpip_adapter_dhcps_cb(u8_t client_ip[4])
+{
+    ESP_LOGI(TAG,"softAP assign IP to station,IP is: %d.%d.%d.%d",
+                client_ip[0],client_ip[1],client_ip[2],client_ip[3]);
+    system_event_t evt;
+    evt.event_id = SYSTEM_EVENT_AP_STAIPASSIGNED;
+    esp_event_send(&evt);
 }
 
 void tcpip_adapter_init(void)
@@ -175,12 +185,20 @@ esp_err_t tcpip_adapter_start(tcpip_adapter_if_t tcpip_if, uint8_t *mac, tcpip_a
         netif_init = tcpip_if_to_netif_init_fn(tcpip_if);
         assert(netif_init != NULL);
         netif_add(esp_netif[tcpip_if], &ip_info->ip, &ip_info->netmask, &ip_info->gw, NULL, netif_init, tcpip_input);
+
+#if ESP_GRATUITOUS_ARP
+        if (tcpip_if == TCPIP_ADAPTER_IF_STA || tcpip_if == TCPIP_ADAPTER_IF_ETH) {
+            netif_set_garp_flag(esp_netif[tcpip_if]);
+        }
+#endif
     }
 
     if (tcpip_if == TCPIP_ADAPTER_IF_AP) {
         netif_set_up(esp_netif[tcpip_if]);
 
         if (dhcps_status == TCPIP_ADAPTER_DHCP_INIT) {
+            dhcps_set_new_lease_cb(tcpip_adapter_dhcps_cb);
+            
             dhcps_start(esp_netif[tcpip_if], ip_info->ip);
 
             ESP_LOGD(TAG, "dhcp server start:(ip: " IPSTR ", mask: " IPSTR ", gw: " IPSTR ")",
