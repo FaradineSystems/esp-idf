@@ -762,7 +762,8 @@ tGATT_STATUS GATTS_GetAttributeValue(UINT16 attr_handle, UINT16 *length, UINT8 *
                     attr_handle);
 
      if ((p_decl = gatt_find_hdl_buffer_by_attr_handle(attr_handle)) == NULL) {
-         GATT_TRACE_ERROR("Service not created\n"); 
+         GATT_TRACE_ERROR("Service not created\n");
+         *length = 0;
          return GATT_INVALID_HANDLE;
      }
 
@@ -1163,6 +1164,10 @@ void GATT_SetIdleTimeout (BD_ADDR bd_addr, UINT16 idle_tout, tBT_TRANSPORT trans
             status = L2CA_SetIdleTimeout (p_tcb->att_lcid, idle_tout, FALSE);
         }
     }
+
+#if (CONFIG_BT_STACK_NO_LOG)
+    (void) status;
+#endif
 
     GATT_TRACE_API ("GATT_SetIdleTimeout idle_tout=%d status=%d(1-OK 0-not performed)",
                     idle_tout, status);

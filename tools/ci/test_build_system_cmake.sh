@@ -212,6 +212,32 @@ function run_tests()
     mv CMakeLists.bak CMakeLists.txt
     assert_built ${APP_BINS} ${BOOTLOADER_BINS} ${PARTITION_BIN}
 
+    print_status "Building a project with CMake and PSRAM workaround, all files compile with workaround"
+    cp sdkconfig sdkconfig.bak
+    rm -rf build
+    echo "CONFIG_SPIRAM_SUPPORT=y" >> sdkconfig
+    echo "CONFIG_SPIRAM_CACHE_WORKAROUND=y" >> sdkconfig
+    # note: we do 'reconfigure' here, as we just need to run cmake
+    idf.py reconfigure
+    grep -q '"command"' build/compile_commands.json || failure "compile_commands.json missing or has no no 'commands' in it"
+    (grep '"command"' build/compile_commands.json | grep -v mfix-esp32-psram-cache-issue) && failure "All commands in compile_commands.json should use PSRAM cache workaround"
+    mv sdkconfig.bak sdkconfig
+
+    print_status "Make sure a full build never runs '/usr/bin/env python' or similar"
+    OLDPATH="$PATH"
+    PYTHON="$(which python)"
+    rm -rf build
+    cat > ./python << EOF
+    #!/bin/sh
+    echo "The build system has executed '/usr/bin/env python' or similar"
+    exit 1
+EOF
+    chmod +x ./python
+    export PATH="$(pwd):$PATH"
+    ${PYTHON} $IDF_PATH/tools/idf.py build || failure "build failed"
+    export PATH="$OLDPATH"
+    rm ./python
+
     print_status "All tests completed"
     if [ -n "${FAILURES}" ]; then
         echo "Some failures were detected:"

@@ -69,6 +69,14 @@ else()
     register_component()
 
     target_link_libraries(esp32 "-L ${CMAKE_CURRENT_SOURCE_DIR}/lib")
+
+    # Add a different linker search path depending on WiFi optimisations
+    if (CONFIG_ESP32_WIFI_IRAM_OPT)
+        target_link_libraries(esp32 "-L ${CMAKE_CURRENT_SOURCE_DIR}/ld/wifi_iram_opt")
+    else()
+        target_link_libraries(esp32 "-L ${CMAKE_CURRENT_SOURCE_DIR}/ld/wifi_iram_noopt")
+    endif()
+
     if(NOT CONFIG_NO_BLOBS)
         target_link_libraries(esp32 coexist core espnow mesh net80211 phy pp rtc smartconfig wpa2 wpa wps)
     endif()
@@ -82,7 +90,10 @@ else()
         )
 
     if(CONFIG_SPIRAM_CACHE_WORKAROUND)
-        add_compile_options(-mfix-esp32-psram-cache-issue)
+        # Note: Adding as a PUBLIC compile option here causes this option to propagate to all components that depend on esp32.
+        #
+        # To handle some corner cases, the same flag is set in project_include.cmake
+        target_compile_options(esp32 PUBLIC -mfix-esp32-psram-cache-issue)
     else()
         target_linker_script(esp32 "ld/esp32.rom.spiram_incompatible_fns.ld")
     endif()
@@ -134,4 +145,9 @@ else()
 
     endif()
 
+    # disable stack protection in files which are involved in initialization of that feature
+    set_source_files_properties(
+        stack_check.c cpu_start.c
+        PROPERTIES COMPILE_FLAGS
+        -fno-stack-protector)
 endif()
